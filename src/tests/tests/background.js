@@ -1,8 +1,8 @@
-/* globals badger:false */
+import constants from "../../js/constants.js";
+import mdfp from "../../js/multiDomainFirstParties.js";
+import utils from "../../js/utils.js";
 
-(function () {
-
-const DNT_COMPLIANT_DOMAIN = 'eff.org',
+const DNT_COMPLIANT_DOMAIN = 'www.eff.org',
   DNT_DOMAINS = [
     DNT_COMPLIANT_DOMAIN,
     'dnt2.example',
@@ -12,13 +12,8 @@ const DNT_COMPLIANT_DOMAIN = 'eff.org',
   ],
   POLICY_URL = chrome.runtime.getURL('data/dnt-policy.txt');
 
-let utils = require('utils'),
-  constants = require('constants'),
-  migrations = require('migrations').Migrations,
-  mdfp = require('multiDomainFP');
-
 let clock,
-  server,
+  stubbedFetch,
   xhrSpy,
   dnt_policy_txt;
 
@@ -54,20 +49,18 @@ QUnit.module("Background", {
     let done = assert.async();
 
     // fetch locally stored DNT policy
-    utils.xhrRequest(POLICY_URL, function (err, data) {
+    utils.fetchResource(POLICY_URL, function (_, data) {
       dnt_policy_txt = data;
 
-      // set up fake server to simulate XMLHttpRequests
-      server = sinon.fakeServer.create({
-        respondImmediately: true
-      });
+      // set up fake server to simulate fetch()
+      stubbedFetch = sinon.stub(window, 'fetch');
       DNT_DOMAINS.forEach(domain => {
-        server.respondWith(
-          "GET",
-          "https://" + domain + "/.well-known/dnt-policy.txt",
-          [200, {}, dnt_policy_txt]
-        );
+        stubbedFetch
+          .withArgs("https://" + domain + "/.well-known/dnt-policy.txt")
+          .resolves(new Response(dnt_policy_txt));
       });
+      // all other URLs
+      stubbedFetch.resolves(new Response("not the DNT policy"));
 
       // set up fake timers to simulate window.setTimeout and co.
       clock = sinon.useFakeTimers(+new Date());
@@ -77,18 +70,17 @@ QUnit.module("Background", {
   },
 
   beforeEach: (/*assert*/) => {
-    // spy on utils.xhrRequest
-    xhrSpy = sinon.spy(utils, "xhrRequest");
+    xhrSpy = sinon.spy(utils, "fetchResource");
   },
 
   afterEach: (/*assert*/) => {
     // reset call counts, etc. after each test
-    utils.xhrRequest.restore();
+    utils.fetchResource.restore();
   },
 
   after: (/*assert*/) => {
     clock.restore();
-    server.restore();
+    fetch.restore();
   }
 });
 
@@ -187,13 +179,10 @@ QUnit.test("mergeUserData does not unblock formerly blocked domains", (assert) =
       },
       snitch_map: {
         'foo.com': SITE_DOMAINS
-      },
-      settings_map: {
-        migrationLevel: 0
       }
     };
 
-  badger.mergeUserData(USER_DATA);
+  badger.storage.mergeUserData(USER_DATA);
 
   assert.equal(
     badger.storage.action_map.getItem('foo.com').heuristicAction,
@@ -204,14 +193,6 @@ QUnit.test("mergeUserData does not unblock formerly blocked domains", (assert) =
     badger.storage.snitch_map.getItem('foo.com'),
     SITE_DOMAINS,
     "snitch map was migrated"
-  );
-
-  badger.runMigrations();
-
-  assert.equal(
-    badger.storage.action_map.getItem('foo.com').heuristicAction,
-    constants.BLOCK,
-    "foo.com is still blocked after running migrations"
   );
 });
 
@@ -231,7 +212,7 @@ QUnit.test("user-blocked domains keep their tracking history", (assert) => {
       }
     };
 
-  badger.mergeUserData(USER_DATA);
+  badger.storage.mergeUserData(USER_DATA);
 
   assert.equal(
     badger.storage.getAction('foo.com'),
@@ -261,7 +242,7 @@ QUnit.test("merging snitch maps results in a blocked domain", (assert) => {
     snitch_map: {'foo.com': ['b.co', 'c.co']},
   };
 
-  badger.mergeUserData(USER_DATA);
+  badger.storage.mergeUserData(USER_DATA);
 
   assert.equal(
     badger.storage.action_map.getItem('foo.com').heuristicAction,
@@ -290,7 +271,7 @@ QUnit.test("subdomain that is not blocked does not override subdomain that is", 
     snitch_map: {'bar.com': ['a.co']}
   };
 
-  badger.mergeUserData(USER_DATA);
+  badger.storage.mergeUserData(USER_DATA);
 
   assert.equal(
     badger.storage.action_map.getItem('sub.bar.com').heuristicAction,
@@ -327,15 +308,15 @@ QUnit.test("subdomains on the yellowlist are preserved", (assert) => {
       }
     };
 
-  const actionMap = badger.storage.getBadgerStorageObject('action_map'),
-    snitchMap = badger.storage.getBadgerStorageObject('snitch_map');
+  const actionMap = badger.storage.getStore('action_map'),
+    snitchMap = badger.storage.getStore('snitch_map');
 
   // merge in a blocked parent domain and a subdomain
-  badger.mergeUserData(USER_DATA);
+  badger.storage.mergeUserData(USER_DATA);
 
-  assert.notOk(actionMap.getItem(SUBDOMAIN),
-    SUBDOMAIN + " should have been discarded during merge"
-  );
+  assert.ok(actionMap.getItem(SUBDOMAIN),
+    SUBDOMAIN + " should have been preserved during merge");
+  assert.equal(badger.storage.getBestAction(SUBDOMAIN), constants.BLOCK);
 
   // clean up
   actionMap.deleteItem(DOMAIN);
@@ -343,11 +324,10 @@ QUnit.test("subdomains on the yellowlist are preserved", (assert) => {
   snitchMap.deleteItem(DOMAIN);
 
   // now add subdomain to yellowlist
-  badger.storage.getBadgerStorageObject('cookieblock_list')
-    .setItem(SUBDOMAIN, true);
+  badger.storage.getStore('cookieblock_list').setItem(SUBDOMAIN, true);
 
   // and do the merge again
-  badger.mergeUserData(USER_DATA);
+  badger.storage.mergeUserData(USER_DATA);
 
   assert.ok(actionMap.getItem(SUBDOMAIN),
     SUBDOMAIN + " should be present in action_map"
@@ -357,18 +337,19 @@ QUnit.test("subdomains on the yellowlist are preserved", (assert) => {
     constants.COOKIEBLOCK,
     SUBDOMAIN + " should be cookieblocked"
   );
+  assert.equal(badger.storage.getBestAction(SUBDOMAIN), constants.COOKIEBLOCK);
 });
 
-QUnit.test("forgetFirstPartySnitches migration properly handles snitch entries with no MDFP entries", (assert) => {
-  const actionMap = badger.storage.getBadgerStorageObject('action_map'),
-    snitchMap = badger.storage.getBadgerStorageObject('snitch_map');
+QUnit.test("mergeUserData() preserves snitch map data when no MDFP", (assert) => {
+  const actionMap = badger.storage.getStore('action_map'),
+    snitchMap = badger.storage.getStore('snitch_map'),
+    TRACKER = 'amazon.com';
 
-  let snitchNoMDFP = {
-    'amazon.com': ['amazonads.com', 'amazing.com', 'amazonrainforest.com']
+  let snitch_map = {
+    [TRACKER]: ['amazonads.com', 'amazing.com', 'amazonrainforest.com']
   };
-
-  let actionNoMDFP = {
-    'amazon.com': {
+  let action_map = {
+    [TRACKER]: {
       heuristicAction: "cookieblock",
       userAction: "",
       dnt: false,
@@ -376,33 +357,33 @@ QUnit.test("forgetFirstPartySnitches migration properly handles snitch entries w
     }
   };
 
-  snitchMap.updateObject(snitchNoMDFP);
-  actionMap.updateObject(actionNoMDFP);
-  migrations.forgetFirstPartySnitches(badger);
+  assert.notOk(actionMap.getItem(TRACKER), "no data before test");
+  assert.notOk(snitchMap.getItem(TRACKER), "no data before test");
+
+  badger.storage.mergeUserData({ action_map, snitch_map });
 
   assert.deepEqual(
-    actionMap.getItem('amazon.com'),
-    actionNoMDFP['amazon.com'],
+    actionMap.getItem(TRACKER),
+    action_map[TRACKER],
     "action map preserved for domain with no MDFP snitch entries"
   );
-
   assert.deepEqual(
-    snitchMap.getItem('amazon.com'),
-    snitchNoMDFP['amazon.com'],
+    snitchMap.getItem(TRACKER),
+    snitch_map[TRACKER],
     "snitch map entry with no MDFP domains remains the same after migration runs"
   );
 });
 
-QUnit.test("forgetFirstPartySnitches migration properly handles snitch entries with some MDFP entries", (assert) => {
-  const actionMap = badger.storage.getBadgerStorageObject('action_map'),
-    snitchMap = badger.storage.getBadgerStorageObject('snitch_map');
+QUnit.test("mergeUserData() removes MDFP entries from snitch map", (assert) => {
+  const actionMap = badger.storage.getStore('action_map'),
+    snitchMap = badger.storage.getStore('snitch_map'),
+    TRACKER = 'amazon.com';
 
-  let snitchSomeMDFP = {
-    'amazon.com': ['amazon.ca', 'amazon.co.jp', 'amazing.com']
+  let snitch_map = {
+    [TRACKER]: ['amazon.ca', 'amazon.co.jp', 'amazing.com']
   };
-
-  let actionSomeMDFP = {
-    'amazon.com': {
+  let action_map = {
+    [TRACKER]: {
       heuristicAction: "cookieblock",
       userAction: "",
       dnt: false,
@@ -410,31 +391,33 @@ QUnit.test("forgetFirstPartySnitches migration properly handles snitch entries w
     }
   };
 
-  snitchMap.updateObject(snitchSomeMDFP);
-  actionMap.updateObject(actionSomeMDFP);
-  migrations.forgetFirstPartySnitches(badger);
+  assert.notOk(actionMap.getItem(TRACKER), "no data before test");
+  assert.notOk(snitchMap.getItem(TRACKER), "no data before test");
+
+  badger.storage.mergeUserData({ action_map, snitch_map });
 
   assert.equal(
-    badger.storage.getAction('amazon.com'),
+    badger.storage.getAction(TRACKER),
     constants.ALLOW,
-    "Action downgraded for partial MDFP domain"
+    "action downgraded to not-yet-blocked for partial MDFP domain"
   );
-
-  assert.deepEqual(snitchMap.getItem('amazon.com'),
+  assert.deepEqual(
+    snitchMap.getItem(TRACKER),
     ["amazing.com"],
-    'forget first party migration properly removes MDFP domains and leaves regular domains');
+    "MDFP entries were removed, non-MDFP entries were left alone"
+  );
 });
 
-QUnit.test("forgetFirstPartySnitches migration properly handles snitch entries with all MDFP entries", (assert) => {
-  const actionMap = badger.storage.getBadgerStorageObject('action_map'),
-    snitchMap = badger.storage.getBadgerStorageObject('snitch_map');
+QUnit.test("mergeUserData() clears snitch_map when all items are MDFP", (assert) => {
+  const actionMap = badger.storage.getStore('action_map'),
+    snitchMap = badger.storage.getStore('snitch_map'),
+    TRACKER = 'amazon.com';
 
-  let snitchAllMDFP = {
-    'amazon.com': ['amazon.ca', 'amazon.co.jp', 'amazon.es']
+  let snitch_map = {
+    [TRACKER]: ['amazon.ca', 'amazon.co.jp', 'amazon.es']
   };
-
-  let actionAllMDFP = {
-    'amazon.com': {
+  let action_map = {
+    [TRACKER]: {
       heuristicAction: "cookieblock",
       userAction: "",
       dnt: false,
@@ -442,26 +425,178 @@ QUnit.test("forgetFirstPartySnitches migration properly handles snitch entries w
     }
   };
 
+  assert.notOk(actionMap.getItem(TRACKER), "no data before test");
+  assert.notOk(snitchMap.getItem(TRACKER), "no data before test");
+
   // confirm all entries are MDFP
-  snitchAllMDFP["amazon.com"].forEach((domain) => {
+  snitch_map[TRACKER].forEach(domain => {
     assert.ok(
-      mdfp.isMultiDomainFirstParty('amazon.com', domain),
-      domain + " is indeed MDFP to amazon.com"
+      mdfp.isMultiDomainFirstParty(TRACKER, domain),
+      `${domain} is indeed MDFP to ${TRACKER}`
     );
   });
 
-  snitchMap.updateObject(snitchAllMDFP);
-  actionMap.updateObject(actionAllMDFP);
-  migrations.forgetFirstPartySnitches(badger);
-
-  assert.notOk(snitchMap.getItem('amazon.com'),
-    'forget first party migration properly removes a snitch map entry with all MDFP domains attributed to it');
+  badger.storage.mergeUserData({ action_map, snitch_map });
 
   assert.equal(
-    badger.storage.getAction('amazon.com'),
+    badger.storage.getAction(TRACKER),
     constants.NO_TRACKING,
-    "Action downgraded for all MDFP domain"
+    "all MDFP domain is no longer known as a tracker"
+  );
+  assert.notOk(
+    snitchMap.getItem(TRACKER),
+    "all-MDFP snitch_map data was removed entirely"
   );
 });
 
+(function () {
+  let IS_UPDATE, LEARN_LOCALLY;
+
+  let newActionMap = {
+    "google-analytics.com": {
+      dnt: false,
+      heuristicAction: constants.BLOCK,
+      nextUpdateTime: 1602152953782,
+      userAction: ""
+    },
+    "youtube.com": {
+      dnt: false,
+      heuristicAction: constants.COOKIEBLOCK,
+      nextUpdateTime: 0,
+      userAction: ""
+    },
+  };
+  let newSnitchMap = {
+    "google-analytics.com": [
+      "linkedin.com",
+      "google.com",
+      "godaddy.com"
+    ],
+    "youtube.com": [
+      "apache.org",
+      "github.com",
+      "who.int",
+    ],
+  };
+
+  QUnit.module("updateTrackerData()", {
+    before: (/*assert*/) => {
+      IS_UPDATE = badger.isUpdate;
+      LEARN_LOCALLY = badger.getSettings().getItem("learnLocally");
+
+      badger.isUpdate = true;
+      badger.getSettings().setItem("learnLocally", false);
+
+      stubbedFetch = sinon.stub(window, 'fetch');
+    },
+
+    after: (/*assert*/) => {
+      fetch.restore();
+
+      badger.getSettings().setItem("learnLocally", LEARN_LOCALLY);
+      badger.isUpdate = IS_UPDATE;
+    }
+  });
+
+  QUnit.test("user-set sliders are preserved", async (assert) => {
+    const NUM_TESTS = 2;
+    let done = assert.async();
+    assert.expect(NUM_TESTS);
+
+    // initial state
+    ["youtube.com", "linkedin.com", "netflix.com"].forEach(site => {
+      badger.heuristicBlocking.updateTrackerPrevalence(
+        "doubleclick.net", "doubleclick.net", site);
+    });
+    badger.storage.setupUserAction("example.com", constants.USER_COOKIEBLOCK);
+    let customSliders = {
+      "example.com": badger.storage.getStore('action_map').getItem("example.com"),
+    };
+
+    // perform the update
+    stubbedFetch
+      .withArgs(constants.SEED_DATA_LOCAL_URL)
+      .resolves(new Response(JSON.stringify({
+        action_map: newActionMap,
+        snitch_map: newSnitchMap
+      })));
+    await badger.updateTrackerData();
+
+    // check what happened
+    let expectedActionMap = Object.assign(customSliders, newActionMap);
+    assert.deepEqual(
+      badger.storage.getStore('action_map').getItemClones(),
+      expectedActionMap,
+      "action map was replaced but custom slider was kept"
+    );
+    assert.deepEqual(
+      badger.storage.getStore('snitch_map').getItemClones(),
+      newSnitchMap,
+      "snitch map was replaced"
+    );
+
+    done();
+  });
+
+  QUnit.test("user-set actions are added to heuristic actions", async (assert) => {
+    const NUM_TESTS = 2;
+    let done = assert.async();
+    assert.expect(NUM_TESTS);
+
+    // initial state
+    ["youtube.com", "linkedin.com", "netflix.com"].forEach(site => {
+      badger.heuristicBlocking.updateTrackerPrevalence(
+        "doubleclick.net", "doubleclick.net", site);
+    });
+    // youtube.com is also in the incoming action map
+    badger.storage.setupUserAction("youtube.com", constants.USER_BLOCK);
+
+    // perform the update
+    stubbedFetch
+      .withArgs(constants.SEED_DATA_LOCAL_URL)
+      .resolves(new Response(JSON.stringify({
+        action_map: newActionMap,
+        snitch_map: newSnitchMap
+      })));
+    await badger.updateTrackerData();
+
+    // check what happened
+    let expectedActionMap = Object.assign({}, newActionMap);
+    expectedActionMap["youtube.com"].userAction = constants.USER_BLOCK;
+    assert.deepEqual(
+      badger.storage.getStore('action_map').getItemClones(),
+      expectedActionMap,
+      "action map was replaced and custom slider was merged in"
+    );
+    assert.deepEqual(
+      badger.storage.getStore('snitch_map').getItemClones(),
+      newSnitchMap,
+      "snitch map was replaced"
+    );
+
+    done();
+  });
+
 }());
+
+QUnit.module("Early-warning checks");
+
+QUnit.test("REQUESTBODY key is Firefox only", (assert) => {
+  let obro = chrome.webRequest.OnBeforeRequestOptions;
+  if (typeof browser == "object" && typeof browser.runtime.getBrowserInfo == "function") {
+    let done = assert.async();
+    browser.runtime.getBrowserInfo().then(function (info) {
+      if (info.name == "Firefox") {
+        assert.notOk(utils.hasOwn(obro, 'REQUEST_BODY'));
+        assert.ok(utils.hasOwn(obro, 'REQUESTBODY'));
+      } else {
+        assert.ok(utils.hasOwn(obro, 'REQUEST_BODY'));
+        assert.notOk(utils.hasOwn(obro, 'REQUESTBODY'));
+      }
+      done();
+    });
+  } else {
+    assert.ok(utils.hasOwn(obro, 'REQUEST_BODY'));
+    assert.notOk(utils.hasOwn(obro, 'REQUESTBODY'));
+  }
+});

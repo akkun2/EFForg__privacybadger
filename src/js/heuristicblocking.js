@@ -1,5 +1,5 @@
 /*
- * This file is part of Privacy Badger <https://www.eff.org/privacybadger>
+ * This file is part of Privacy Badger <https://privacybadger.org/>
  * Copyright (C) 2014 Electronic Frontier Foundation
  *
  * Privacy Badger is free software: you can redistribute it and/or modify
@@ -15,45 +15,57 @@
  * along with Privacy Badger.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* globals badger:false, log:false, URI:false */
+/* globals badger:false */
 
-var constants = require("constants");
-var utils = require("utils");
-var incognito = require("incognito");
+import { extractHostFromURL, getBaseDomain, URI } from "../lib/basedomain.js";
+import { getInitiatorUrl } from "../lib/webrequestUtils.js";
 
-require.scopes.heuristicblocking = (function() {
-
-
+import { log } from "./bootstrap.js";
+import constants from "./constants.js";
+import utils from "./utils.js";
 
 /*********************** heuristicblocking scope **/
 // make heuristic obj with utils and storage properties and put the things on it
 function HeuristicBlocker(pbStorage) {
-  this.storage = pbStorage;
+  let self = this;
+
+  self.storage = pbStorage;
 
   // TODO roll into tabData? -- 6/10/2019 not for now, since tabData is populated
-  // by the synchronous listeners in webrequests.js and tabOrigins is used by the
+  // by the synchronous listeners in webrequests.js and tabBases is used by the
   // async listeners here; there's no way to enforce ordering of requests among
   // those two. Also, tabData is cleaned up every time a tab is closed, so
   // dangling requests that don't trigger listeners until after the tab closes are
   // impossible to attribute to a tab.
-  this.tabOrigins = {};
-  this.tabUrls = {};
+  self.tabBases = {};
+  self.tabUrls = {};
 }
 
 HeuristicBlocker.prototype = {
 
   /**
-   * Blocks or cookieblocks an FQDN.
-   * Blocks or cookieblocks its base domain.
-   * Cookieblocks any yellowlisted subdomains that share the base domain with the FQDN.
-   *
-   * @param {String} base The base domain (etld+1) to blacklist
-   * @param {String} fqdn The FQDN
+   * Initializes tab bases and URLs for already-open tabs
    */
-  blacklistOrigin: function (base, fqdn) {
+  initTabData: function (tab_id, tab_url) {
+    let self = this;
+    self.tabBases[tab_id] = getBaseDomain((new URI(tab_url)).host);
+    self.tabUrls[tab_id] = tab_url;
+  },
+
+  /**
+   * Blocklists a domain:
+   *
+   * - Blocks or cookieblocks the given domain.
+   * - Blocks or cookieblocks its eTLD+1 ("base" domain).
+   * - Cookieblocks any yellowlisted subdomains that
+   *   share the base domain with the given domain.
+   *
+   * @param {String} base The base domain (eTLD+1) to blocklist
+   * @param {String} fqdn The domain to blocklist
+   */
+  blocklistDomain: function (base, fqdn) {
     let self = this,
-      ylistStorage = self.storage.getBadgerStorageObject("cookieblock_list"),
-      ylist = ylistStorage.getItemClones();
+      ylistStorage = self.storage.getStore("cookieblock_list");
 
     // cookieblock or block the base domain
     if (ylistStorage.hasItem(base)) {
@@ -88,103 +100,190 @@ HeuristicBlocker.prototype = {
     // for example, when google.com is blocked,
     // books.google.com should be cookieblocked
     let base_with_dot = '.' + base;
-    for (let domain in ylist) {
+    ylistStorage.keys().forEach(domain => {
       if (base != domain && domain.endsWith(base_with_dot)) {
         self.storage.setupHeuristicAction(domain, constants.COOKIEBLOCK);
       }
-    }
+    });
 
   },
 
   /**
-   * Wraps _recordPrevalence for use from webRequest listeners.
+   * Checks whether `details` is a third-party Beacon API request.
+   *
+   * Otherwise, checks third-party requests/responses for tracking cookies.
+   *
+   * This wraps _recordPrevalence for use from webRequest listeners.
    * Use updateTrackerPrevalence for non-webRequest initiated bookkeeping.
    *
-   * @param {Object} details request/response details
-   * @param {Boolean} check_for_cookie_share whether to check for cookie sharing
+   * @param {Object} details webRequest request/response details object
    */
-  heuristicBlockingAccounting: function (details, check_for_cookie_share) {
+  checkForTrackingCookies: function (details) {
     // ignore requests that are outside a tabbed window
-    if (details.tabId < 0 || !incognito.learningEnabled(details.tabId)) {
-      return {};
+    if (details.tabId < 0 || !badger.isLearningEnabled(details.tabId)) {
+      return;
     }
 
     let self = this,
-      request_host = (new URI(details.url)).host,
-      request_origin = window.getBaseDomain(request_host);
+      tab_id = details.tabId,
+      from_current_tab = true;
 
     // if this is a main window request, update tab data and quit
     if (details.type == "main_frame") {
-      self.tabOrigins[details.tabId] = request_origin;
-      self.tabUrls[details.tabId] = details.url;
-      return {};
+      let tab_host = (new URI(details.url)).host;
+      self.tabBases[tab_id] = getBaseDomain(tab_host);
+      self.tabUrls[tab_id] = details.url;
+      return;
     }
 
-    let tab_origin = self.tabOrigins[details.tabId];
+    let tab_base = self.tabBases[tab_id];
+    if (!tab_base) {
+      return;
+    }
+
+    let request_host = (new URI(details.url)).host;
+    // CNAME uncloaking
+    if (utils.hasOwn(badger.cnameDomains, request_host)) {
+      // TODO details.url is still wrong
+      request_host = badger.cnameDomains[request_host];
+    }
+    let request_base = getBaseDomain(request_host);
+
+    let initiator_url = getInitiatorUrl(self.tabUrls[tab_id], details);
+    if (initiator_url) {
+      from_current_tab = false;
+      tab_base = getBaseDomain(extractHostFromURL(initiator_url));
+    }
 
     // ignore first-party requests
-    if (!tab_origin || !utils.isThirdPartyDomain(request_origin, tab_origin)) {
-      return {};
+    if (!utils.isThirdPartyDomain(request_base, tab_base)) {
+      return;
     }
 
-    // short-circuit if we already observed this origin tracking on this site
-    let firstParties = self.storage.getBadgerStorageObject('snitch_map').getItem(request_origin);
-    if (firstParties && firstParties.indexOf(tab_origin) > -1) {
-      return {};
+    // short-circuit if we already observed this eTLD+1 tracking on this site
+    let firstParties = self.storage.getStore('snitch_map').getItem(request_base);
+    if (firstParties && firstParties.includes(tab_base)) {
+      return;
     }
 
-    // abort if we already made a decision for this FQDN
-    let action = self.storage.getAction(request_host);
+    // short-circuit if we already made a decision for this FQDN
+    let action = self.storage.getBestAction(request_host);
     if (action != constants.NO_TRACKING && action != constants.ALLOW) {
-      return {};
+      return;
+    }
+
+    if (details.type == "beacon" || details.type == "ping") {
+      self._recordPrevalence(request_host, request_base, tab_base);
+      // update tracking_map
+      badger.storage.recordTrackingDetails(request_base, tab_base, 'beacon');
+      // log in popup
+      if (from_current_tab) {
+        badger.logThirdParty(
+          tab_id, request_host, badger.storage.getBestAction(request_host));
+      }
+      // don't bother checking for tracking cookies
+      return;
     }
 
     // check if there are tracking cookies
-    if (hasCookieTracking(details, request_origin)) {
-      self._recordPrevalence(request_host, request_origin, tab_origin);
-      return {};
-    }
-
-    // check for cookie sharing iff this is an image in the top-level frame, and the request URL has parameters
-    if (check_for_cookie_share && details.type == 'image' && details.frameId === 0 && details.url.indexOf('?') > -1) {
-      // get all non-HttpOnly cookies for the top-level frame
-      // and pass those to the cookie-share accounting function
-      let tab_url = self.tabUrls[details.tabId];
-
-      let config = {
-        url: tab_url
-      };
-      if (badger.firstPartyDomainPotentiallyRequired) {
-        config.firstPartyDomain = null;
-      }
-
-      chrome.cookies.getAll(config, function (cookies) {
-        cookies = cookies.filter(cookie => !cookie.httpOnly);
-        if (cookies.length >= 1) {
-          self.pixelCookieShareAccounting(tab_url, tab_origin, details.url, request_host, request_origin, cookies);
-        }
-      });
+    if (hasCookieTracking(details)) {
+      self._recordPrevalence(request_host, request_base, tab_base);
     }
   },
 
   /**
-   * Checks for cookie sharing: requests to third-party domains that include
-   * high entropy data from first-party cookies (associated with the top-level
-   * frame). Only catches plain-text verbatim sharing (b64 encoding + the like
-   * defeat it). Assumes any long string that doesn't contain URL fragments or
-   * stopwords is an identifier.  Doesn't catch cookie syncing (3rd party -> 3rd
-   * party), but most of those tracking cookies should be blocked anyway.
+   * Calls the pixel cookie sharing checking function
+   * iff the request is for an image in the top-level frame,
+   * and the request URL has querystring parameters.
    *
-   * @param details are those from onBeforeSendHeaders
-   * @param cookies are the result of chrome.cookies.getAll()
-   * @returns {*}
+   * @param {Object} details webRequest onResponseStarted details object
    */
-  pixelCookieShareAccounting: function (tab_url, tab_origin, request_url, request_host, request_origin, cookies) {
-    let params = (new URL(request_url)).searchParams,
-      TRACKER_ENTROPY_THRESHOLD = 33,
+  checkForPixelCookieSharing: function (details) {
+    if (!badger.isLearningEnabled(details.tabId)) {
+      return;
+    }
+
+    if (details.type != 'image' || details.frameId !== 0 || details.url.indexOf('?') == -1) {
+      return;
+    }
+
+    let self = this,
+      tab_base = self.tabBases[details.tabId];
+    if (!tab_base) {
+      return;
+    }
+    let tab_url = self.tabUrls[details.tabId];
+
+    let request_host = (new URI(details.url)).host;
+    // CNAME uncloaking
+    if (utils.hasOwn(badger.cnameDomains, request_host)) {
+      request_host = badger.cnameDomains[request_host];
+    }
+    let request_base = getBaseDomain(request_host);
+
+    let initiator_url = getInitiatorUrl(tab_url, details);
+    if (initiator_url) {
+      tab_url = initiator_url;
+      tab_base = getBaseDomain(extractHostFromURL(initiator_url));
+    }
+
+    // ignore first-party requests
+    if (!utils.isThirdPartyDomain(request_base, tab_base)) {
+      return;
+    }
+
+    // short-circuit if we already observed this eTLD+1 tracking on this site
+    let firstParties = self.storage.getStore('snitch_map').getItem(request_base);
+    if (firstParties && firstParties.includes(tab_base)) {
+      return;
+    }
+
+    // short-circuit if we already made a decision for this FQDN
+    let action = self.storage.getBestAction(request_host);
+    if (action != constants.NO_TRACKING && action != constants.ALLOW) {
+      return;
+    }
+
+    // get all non-HttpOnly cookies for the top-level frame
+    // and pass those to the pixel cookie-share accounting function
+    let config = {
+      url: tab_url
+    };
+    if (badger.firstPartyDomainPotentiallyRequired) {
+      config.firstPartyDomain = null;
+    }
+    chrome.cookies.getAll(config, function (cookies) {
+      cookies = cookies.filter(cookie => !cookie.httpOnly);
+      if (cookies.length < 1) {
+        return;
+      }
+
+      // TODO refactor with new URI() above?
+      let searchParams = (new URL(details.url)).searchParams;
+
+      self.pixelCookieShareAccounting(tab_url, tab_base, searchParams, request_host, request_base, cookies);
+    });
+  },
+
+  /**
+   * Checks for cookie sharing: requests to third-party domains
+   * that include high entropy data from first-party cookies.
+   *
+   * Only catches plain-text verbatim sharing (b64 encoding etc. defeat it).
+   *
+   * Assumes any long string that doesn't contain URL fragments
+   * or stopwords is an identifier.
+   *
+   * Doesn't catch cookie syncing (3rd party -> 3rd party),
+   * but most of those tracking cookies should be blocked anyway.
+   */
+  pixelCookieShareAccounting: function (tab_url, tab_base, searchParams, request_host, request_base, cookies) {
+    const TRACKER_ENTROPY_THRESHOLD = 33,
       MIN_STR_LEN = 8;
 
-    for (let p of params) {
+    let self = this;
+
+    for (let p of searchParams) {
       let key = p[0],
         value = p[1];
 
@@ -248,10 +347,15 @@ HeuristicBlocker.prototype = {
           // our threshold, record the tracking action and exit the function.
           let entropy = utils.estimateMaxEntropy(s);
           if (entropy > TRACKER_ENTROPY_THRESHOLD) {
-            log("Found high-entropy cookie share from", tab_origin, "to", request_host,
+            log("Found high-entropy cookie share from", tab_base, "to", request_host,
               ":", entropy, "bits\n  cookie:", cookie.name, '=', cookie.value,
               "\n  arg:", key, "=", value, "\n  substring:", s);
-            this._recordPrevalence(request_host, request_origin, tab_origin);
+            self._recordPrevalence(request_host, request_base, tab_base);
+
+            // record pixel cookie sharing
+            badger.storage.recordTrackingDetails(
+              request_base, tab_base, 'pixelcookieshare');
+
             return;
           }
         }
@@ -263,85 +367,77 @@ HeuristicBlocker.prototype = {
    * Wraps _recordPrevalence for use outside of webRequest listeners.
    *
    * @param {String} tracker_fqdn The fully qualified domain name of the tracker
-   * @param {String} tracker_origin Base domain of the third party tracker
-   * @param {String} page_origin The base domain of the page
-   *   where the tracker was detected.
-   * @param {Boolean} skip_dnt_check Skip DNT policy checking if flag is true.
-   *
+   * @param {String} tracker_base Base domain of the third party tracker
+   * @param {String} site_base Base domain of page where tracking occurred
    */
-  updateTrackerPrevalence: function(tracker_fqdn, tracker_origin, page_origin, skip_dnt_check) {
-    // abort if we already made a decision for this fqdn
-    let action = this.storage.getAction(tracker_fqdn);
+  updateTrackerPrevalence: function (tracker_fqdn, tracker_base, site_base) {
+    // short-circuit if we already made a decision for this fqdn
+    let action = this.storage.getBestAction(tracker_fqdn);
     if (action != constants.NO_TRACKING && action != constants.ALLOW) {
       return;
     }
 
     this._recordPrevalence(
       tracker_fqdn,
-      tracker_origin,
-      page_origin,
-      skip_dnt_check
+      tracker_base,
+      site_base
     );
   },
 
   /**
    * Record HTTP request prevalence. Block a tracker if seen on more
-   * than constants.TRACKING_THRESHOLD pages
+   * than constants.TRACKING_THRESHOLD pages.
    *
    * NOTE: This is a private function and should never be called directly.
-   * All calls should be routed through heuristicBlockingAccounting for normal usage
+   * All calls should be routed through checkForTrackingCookies for normal usage
    * and updateTrackerPrevalence for manual modifications (e.g. importing
    * tracker lists).
    *
    * @param {String} tracker_fqdn The FQDN of the third party tracker
-   * @param {String} tracker_origin Base domain of the third party tracker
-   * @param {String} page_origin The origin of the page where the third party
-   *   tracker was loaded.
-   * @param {Boolean} skip_dnt_check Skip DNT policy checking if flag is true.
+   * @param {String} tracker_base Base domain of the third party tracker
+   * @param {String} site_base Base domain of page where tracking occurred
    */
-  _recordPrevalence: function (tracker_fqdn, tracker_origin, page_origin, skip_dnt_check) {
-    var snitchMap = this.storage.getBadgerStorageObject('snitch_map');
-    var firstParties = [];
-    if (snitchMap.hasItem(tracker_origin)) {
-      firstParties = snitchMap.getItem(tracker_origin);
-    }
-
+  _recordPrevalence: function (tracker_fqdn, tracker_base, site_base) {
     // GDPR Consent Management Provider
     // https://github.com/EFForg/privacybadger/pull/2245#issuecomment-545545717
-    if (tracker_origin == "consensu.org") {
+    if (tracker_base == "consensu.org") {
       return;
     }
 
-    if (firstParties.indexOf(page_origin) != -1) {
-      return; // We already know about the presence of this tracker on the given domain
+    // do not record Cisco OpenDNS/Umbrella proxy domains
+    if (tracker_fqdn.endsWith(".id.opendns.com")) {
+      return;
     }
 
-    // Check this just-seen-tracking-on-this-site,
-    // not-yet-blocked domain for DNT policy.
-    // We check heuristically-blocked domains in webrequest.js.
-    if (!skip_dnt_check) {
-      setTimeout(function () {
-        badger.checkForDNTPolicy(tracker_fqdn);
-      }, 0);
+    let self = this,
+      firstParties = [],
+      actionMap = self.storage.getStore('action_map'),
+      snitchMap = self.storage.getStore('snitch_map');
+
+    if (!actionMap.hasItem(tracker_fqdn)) {
+      self.storage.setupHeuristicAction(tracker_fqdn, constants.ALLOW);
+      if (!actionMap.hasItem(tracker_base)) {
+        self.storage.setupHeuristicAction(tracker_base, constants.ALLOW);
+      }
     }
 
-    // record that we've seen this tracker on this domain (in snitch map)
-    firstParties.push(page_origin);
-    snitchMap.setItem(tracker_origin, firstParties);
+    if (snitchMap.hasItem(tracker_base)) {
+      firstParties = snitchMap.getItem(tracker_base);
+    }
 
-    // ALLOW indicates this is a tracker still below TRACKING_THRESHOLD
-    // (vs. NO_TRACKING for resources we haven't seen perform tracking yet).
-    // see https://github.com/EFForg/privacybadger/pull/1145#discussion_r96676710
-    this.storage.setupHeuristicAction(tracker_fqdn, constants.ALLOW);
-    this.storage.setupHeuristicAction(tracker_origin, constants.ALLOW);
+    // do not record if already recorded this tracker on the given domain
+    if (firstParties.includes(site_base)) {
+      return;
+    }
 
-    // Blocking based on outbound cookies
-    var httpRequestPrevalence = firstParties.length;
+    // record that we've seen this tracker on this domain
+    firstParties.push(site_base);
+    snitchMap.setItem(tracker_base, firstParties);
 
-    // block the origin if it has been seen on multiple first party domains
-    if (httpRequestPrevalence >= constants.TRACKING_THRESHOLD) {
-      log('blacklisting origin', tracker_fqdn);
-      this.blacklistOrigin(tracker_origin, tracker_fqdn);
+    // (cookie)block if domain was seen tracking on enough first party domains
+    if (firstParties.length >=
+        self.storage.getStore('private_storage').getItem('blockThreshold')) {
+      self.blocklistDomain(tracker_base, tracker_fqdn);
     }
   }
 };
@@ -636,11 +732,10 @@ function _extractCookies(details) {
 /**
  * Check if page is doing cookie tracking. Doing this by estimating the entropy of the cookies
  *
- * @param details details onBeforeSendHeaders details
- * @param {String} origin URL
- * @returns {boolean} true if it has cookie tracking
+ * @param {Object} details onBeforeSendHeaders details
+ * @returns {Boolean} true if it has cookie tracking
  */
-function hasCookieTracking(details, origin) {
+function hasCookieTracking(details) {
   let cookies = _extractCookies(details);
   if (!cookies.length) {
     return false;
@@ -658,13 +753,13 @@ function hasCookieTracking(details, origin) {
 
     // loop over every name/value pair in every cookie
     for (let name in cookie) {
-      if (!cookie.hasOwnProperty(name)) {
+      if (!utils.hasOwn(cookie, name)) {
         continue;
       }
 
-      // ignore CloudFlare
+      // ignore Cloudflare
       // https://support.cloudflare.com/hc/en-us/articles/200170156-Understanding-the-Cloudflare-Cookies
-      if (name == "__cfduid" || name == "__cf_bm") {
+      if (name == "__cf_bm") {
         continue;
       }
 
@@ -678,9 +773,9 @@ function hasCookieTracking(details, origin) {
     }
   }
 
-  log("All cookies for " + origin + " deemed low entropy...");
+  log(`All cookies for ${details.url} deemed low entropy...`);
   if (estimatedEntropy > constants.MAX_COOKIE_ENTROPY) {
-    log("But total estimated entropy is " + estimatedEntropy + " bits, so blocking");
+    log(`But total estimated entropy is ${estimatedEntropy} bits, so blocking`);
     return true;
   }
 
@@ -688,44 +783,49 @@ function hasCookieTracking(details, origin) {
 }
 
 function startListeners() {
-  /**
-   * Adds heuristicBlockingAccounting as listened to onBeforeSendHeaders request
-   */
+  // inspect cookies in outgoing headers
   let extraInfoSpec = ['requestHeaders'];
-  if (chrome.webRequest.OnBeforeSendHeadersOptions.hasOwnProperty('EXTRA_HEADERS')) {
+  if (utils.hasOwn(chrome.webRequest.OnBeforeSendHeadersOptions, 'EXTRA_HEADERS')) {
     extraInfoSpec.push('extraHeaders');
   }
   chrome.webRequest.onBeforeSendHeaders.addListener(function(details) {
-    return badger.heuristicBlocking.heuristicBlockingAccounting(details, true);
-  }, {urls: ["<all_urls>"]}, extraInfoSpec);
+    if (badger.INITIALIZED) {
+      badger.heuristicBlocking.checkForTrackingCookies(details);
+    }
+  }, {urls: ["http://*/*", "https://*/*"]}, extraInfoSpec);
 
-  /**
-   * Adds onResponseStarted listener. Monitor for cookies
-   */
+  // inspect cookies in incoming headers
   extraInfoSpec = ['responseHeaders'];
-  if (chrome.webRequest.OnResponseStartedOptions.hasOwnProperty('EXTRA_HEADERS')) {
+  if (utils.hasOwn(chrome.webRequest.OnResponseStartedOptions, 'EXTRA_HEADERS')) {
     extraInfoSpec.push('extraHeaders');
   }
-  chrome.webRequest.onResponseStarted.addListener(function(details) {
-    var hasSetCookie = false;
-    for (var i = 0; i < details.responseHeaders.length; i++) {
-      if (details.responseHeaders[i].name.toLowerCase() == "set-cookie") {
-        hasSetCookie = true;
-        break;
+  chrome.webRequest.onResponseStarted.addListener(function (details) {
+    if (!badger.INITIALIZED) {
+      return;
+    }
+
+    // check for cookie tracking if there are any set-cookie headers
+    let has_setcookie_header = false;
+    if (details.responseHeaders) {
+      for (let i = 0; i < details.responseHeaders.length; i++) {
+        if (details.responseHeaders[i].name.toLowerCase() == "set-cookie") {
+          has_setcookie_header = true;
+          break;
+        }
       }
     }
-    if (hasSetCookie) {
-      return badger.heuristicBlocking.heuristicBlockingAccounting(details, false);
+    if (has_setcookie_header) {
+      badger.heuristicBlocking.checkForTrackingCookies(details);
     }
-  },
-  {urls: ["<all_urls>"]}, extraInfoSpec);
+
+    // check for pixel cookie sharing if the response appears to be for an image pixel
+    badger.heuristicBlocking.checkForPixelCookieSharing(details);
+
+  }, {urls: ["http://*/*", "https://*/*"]}, extraInfoSpec);
 }
 
-/************************************** exports */
-var exports = {};
-exports.HeuristicBlocker = HeuristicBlocker;
-exports.startListeners = startListeners;
-exports.hasCookieTracking = hasCookieTracking;
-return exports;
-/************************************** exports */
-})();
+export default {
+  hasCookieTracking,
+  HeuristicBlocker,
+  startListeners,
+};

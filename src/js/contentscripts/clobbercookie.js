@@ -1,5 +1,5 @@
 /*
- * This file is part of Privacy Badger <https://www.eff.org/privacybadger>
+ * This file is part of Privacy Badger <https://privacybadger.org/>
  * Copyright (C) 2014 Electronic Frontier Foundation
  *
  * Privacy Badger is free software: you can redistribute it and/or modify
@@ -33,7 +33,7 @@ if (window.top == window) {
 
 // TODO race condition; fix waiting on https://crbug.com/478183
 chrome.runtime.sendMessage({
-  type: "checkLocation",
+  type: "checkClobberingEnabled",
   frameUrl: window.FRAME_URL
 }, function (blocked) {
   if (blocked) {
